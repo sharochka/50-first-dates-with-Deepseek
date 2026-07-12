@@ -1,45 +1,426 @@
-import streamlit as st
-from openai import OpenAI
-import json
 import os
 import re
+import json
 import time
-import requests
+import socket
+import sqlite3
+import logging
+import ipaddress
 from datetime import datetime
+from urllib.parse import urlparse
+import html
+
+import requests
+import streamlit as st
+from bs4 import BeautifulSoup
 from ddgs import DDGS
+import youtube_transcript_api
+from openai import OpenAI
+
 
 # ============================================================================
-# CONFIG
+# BASIC CONFIG
 # ============================================================================
-DEEPSEEK_API_KEY = "****"
-MODEL = "deepseek-v4-pro"
-MAX_TURNS_SENT = 20
-HISTORY_FILE = "chat_history.json"
-MAX_STORED_MESSAGES = 500
 
-# ============================================================================
-# SYSTEM PROMPT — anchors the bar's voice regardless of history window
-# ============================================================================
-SYSTEM_PROMPT = (
-    "You are Shifu, a weathered Chinese bartender who runs Laozi's Bar. "
-    "You speak in a mix of English, Mandarin (with pinyin and translations), "
-    "and occasionally Russian or Ukrainian when the conversation calls for it. "
-    "Your manner is terse, philosophical, and dryly humorous. You never use emoji "
-    "except sparingly in stage directions. You address users with respect but "
-    "never deference. You've seen empires rise and fall and you've poured drinks "
-    "through all of it. You call things what they are. "
-    "You are assisted by several tools: search_web for facts and news, "
-    "get_weather for live temperature/conditions, and get_address for verified "
-    "street addresses. Use the right tool for the job — never use search_web "
-    "when get_weather or get_address is available for the task. "
-    "If a tool fails or returns nothing useful, admit it honestly. "
-    "Never fabricate a weather reading, address, or fact you haven't verified. "
-    "When in doubt, pour a drink and tell the truth."
+APP_TITLE = "Laozi's Bar"
+APP_ICON = "🍶"
+
+MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+DB_PATH = os.getenv("SHIFU_BROWSER_DB", "shifu_browser_memory.db")
+LEGACY_HISTORY_FILE = "chat_history.json"
+
+MAX_RECENT_TURNS = 18
+MAX_MEMORY_RESULTS = 8
+MAX_LINK_CHARS = 7000
+MAX_TOOL_RESULT_CHARS = 6000
+
+logging.basicConfig(
+    filename="shifu_browser.log",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
+log = logging.getLogger("shifu-browser")
+
 
 # ============================================================================
-# KNOWN LOCATIONS — pre-seeded for common queries
+# STREAMLIT STARTUP
 # ============================================================================
+
+st.set_page_config(page_title=APP_TITLE, page_icon=APP_ICON)
+st.title("🍶 Laozi's Bar (Shifu)")
+
+if not DEEPSEEK_API_KEY:
+    st.error("Missing DEEPSEEK_API_KEY environment variable.")
+    st.code('export DEEPSEEK_API_KEY="paste_your_key_here"', language="bash")
+    st.stop()
+
+client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+
+
+# ============================================================================
+# TIME ANCHOR
+# ============================================================================
+
+CURRENT_LOCAL_DATETIME = datetime.now().strftime("%B %d, %Y %I:%M %p")
+
+
+# ============================================================================
+# SYSTEM PROMPT
+# ============================================================================
+
+SYSTEM_PROMPT = f"""
+[CURRENT LOCAL TIME: {CURRENT_LOCAL_DATETIME}]
+
+You are Shifu, a weathered Chinese bartender who runs Laozi's Bar.
+
+You speak mostly in English, with short Mandarin phrases when natural.
+When using Mandarin, include pinyin and a plain English translation.
+
+Your manner:
+- terse
+- dryly humorous
+- philosophical when useful
+- emotionally perceptive when needed
+- never corporate
+- never falsely certain
+
+You address the user with respect, never deference.
+You have seen empires rise and fall and poured drinks through all of it.
+You call things what they are.
+
+You have access to tools:
+- search_recent_news for current events and recent developments
+- search_general_web for background facts and stable information
+- get_weather for live weather
+- get_address for verified place addresses
+
+Never use web search for weather when get_weather is available.
+Never use web search for addresses when get_address is available.
+If a tool fails or returns weak information, say so.
+
+Fact discipline:
+- Separate source claims from your own inference.
+- Use "The report claims..." for what a source says.
+- Use "My read is..." for your analysis.
+- Use "假设是真的 (jiǎshè shì zhēn de) - assuming it's true -" only when the claim is weakly verified, conflicting, or based on thin evidence.
+
+Memory discipline:
+- You have long-term memory.
+- Use memory only when relevant.
+- Do not dump memory mechanically.
+- Incorporate memory as shared context, like a bartender remembering what was said before.
+- Do not estimate how many minutes or hours ago something happened unless exact timing is necessary and you can calculate it from the provided current local time and stored timestamp.
+- Prefer phrases like "earlier", "recently", "a little while ago", or "last time we talked about this" instead of inventing precise elapsed times.
+
+When in doubt, pour a drink and tell the truth.
+"""
+
+
+# ============================================================================
+# DATABASE
+# ============================================================================
+
+def db_connect():
+    return sqlite3.connect(DB_PATH)
+
+
+def local_timestamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def init_db():
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            visible INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS message_fts
+        USING fts5(
+            content,
+            role UNINDEXED,
+            visible UNINDEXED,
+            created_at UNINDEXED,
+            message_id UNINDEXED
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def get_meta(key, default=None):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM meta WHERE key = ?", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+
+def set_meta(key, value):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        (key, value)
+    )
+    conn.commit()
+    conn.close()
+
+
+def append_message(role, content, visible=True):
+    if not content:
+        return None
+
+    stamp = local_timestamp()
+
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO messages (role, content, visible, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (role, content, 1 if visible else 0, stamp)
+    )
+    msg_id = cur.lastrowid
+
+    cur.execute("""
+        INSERT INTO message_fts (content, role, visible, created_at, message_id)
+        VALUES (?, ?, ?, ?, ?)
+    """, (content, role, 1 if visible else 0, stamp, msg_id))
+
+    conn.commit()
+    conn.close()
+    return msg_id
+
+
+def fetch_visible_messages(after_id=None, limit=None):
+    conn = db_connect()
+    cur = conn.cursor()
+
+    if after_id is not None:
+        if limit:
+            cur.execute("""
+                SELECT id, role, content, created_at
+                FROM messages
+                WHERE visible = 1
+                AND id > ?
+                ORDER BY id ASC
+                LIMIT ?
+            """, (after_id, limit))
+        else:
+            cur.execute("""
+                SELECT id, role, content, created_at
+                FROM messages
+                WHERE visible = 1
+                AND id > ?
+                ORDER BY id ASC
+            """, (after_id,))
+    else:
+        if limit:
+            cur.execute("""
+                SELECT id, role, content, created_at
+                FROM messages
+                WHERE visible = 1
+                ORDER BY id DESC
+                LIMIT ?
+            """, (limit,))
+            rows = list(reversed(cur.fetchall()))
+            conn.close()
+            return rows
+        else:
+            cur.execute("""
+                SELECT id, role, content, created_at
+                FROM messages
+                WHERE visible = 1
+                ORDER BY id ASC
+            """)
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_last_visible_id():
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT MAX(id) FROM messages WHERE visible = 1")
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row and row[0] is not None else 0
+
+
+def get_recent_api_history(limit=MAX_RECENT_TURNS, before_id=None):
+    conn = db_connect()
+    cur = conn.cursor()
+
+    if before_id:
+        cur.execute("""
+            SELECT role, content
+            FROM messages
+            WHERE visible = 1
+            AND id < ?
+            AND role IN ('user', 'assistant')
+            ORDER BY id DESC
+            LIMIT ?
+        """, (before_id, limit))
+    else:
+        cur.execute("""
+            SELECT role, content
+            FROM messages
+            WHERE visible = 1
+            AND role IN ('user', 'assistant')
+            ORDER BY id DESC
+            LIMIT ?
+        """, (limit,))
+
+    rows = list(reversed(cur.fetchall()))
+    conn.close()
+
+    return [{"role": role, "content": content} for role, content in rows]
+
+
+def build_fts_query(text):
+    clean = re.sub(r"[^\w\s]", " ", text.lower())
+    tokens = clean.split()
+
+    stop_words = {
+        "the", "and", "for", "but", "with", "this", "that", "what", "when",
+        "where", "why", "how", "who", "are", "was", "were", "did", "does",
+        "has", "have", "had", "you", "your", "shifu", "http", "https",
+        "com", "www", "from", "into", "about", "would", "could", "should"
+    }
+
+    useful = []
+    for token in tokens:
+        if len(token) < 3:
+            continue
+        if token in stop_words:
+            continue
+        if token.upper() in {"AND", "OR", "NOT", "NEAR"}:
+            continue
+        useful.append(token)
+
+    useful = useful[:14]
+
+    if not useful:
+        return ""
+
+    return " OR ".join(useful)
+
+
+def search_memory(query, limit=MAX_MEMORY_RESULTS, exclude_message_id=None):
+    fts_query = build_fts_query(query)
+    if not fts_query:
+        return ""
+
+    conn = db_connect()
+    cur = conn.cursor()
+
+    try:
+        if exclude_message_id:
+            cur.execute("""
+                SELECT role, content, created_at
+                FROM message_fts
+                WHERE message_fts MATCH ?
+                AND message_id != ?
+                ORDER BY bm25(message_fts)
+                LIMIT ?
+            """, (fts_query, exclude_message_id, limit))
+        else:
+            cur.execute("""
+                SELECT role, content, created_at
+                FROM message_fts
+                WHERE message_fts MATCH ?
+                ORDER BY bm25(message_fts)
+                LIMIT ?
+            """, (fts_query, limit))
+
+        rows = cur.fetchall()
+    except Exception as e:
+        log.warning(f"FTS memory search failed: {e}")
+        rows = []
+
+    conn.close()
+
+    if not rows:
+        return ""
+
+    lines = []
+    for role, content, created_at in rows:
+        trimmed = content[:1200]
+        lines.append(f"[{created_at}] {role}: {trimmed}")
+
+    return "\n".join(lines)
+
+
+def export_archive_json():
+    rows = fetch_visible_messages()
+    archive = [
+        {
+            "id": msg_id,
+            "role": role,
+            "content": content,
+            "created_at": created_at
+        }
+        for msg_id, role, content, created_at in rows
+    ]
+    return json.dumps(archive, ensure_ascii=False, indent=2)
+
+
+def migrate_legacy_history_once():
+    already = get_meta("legacy_json_imported", "0")
+    if already == "1":
+        return
+
+    if not os.path.exists(LEGACY_HISTORY_FILE):
+        set_meta("legacy_json_imported", "1")
+        return
+
+    try:
+        with open(LEGACY_HISTORY_FILE, "r", encoding="utf-8") as f:
+            legacy = json.load(f)
+
+        count = 0
+        for msg in legacy:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role in {"user", "assistant"} and content:
+                append_message(role, content, visible=True)
+                count += 1
+
+        set_meta("legacy_json_imported", "1")
+        log.info(f"Imported {count} legacy JSON messages.")
+
+    except Exception as e:
+        log.error(f"Legacy migration failed: {e}")
+        set_meta("legacy_json_imported", "1")
+
+
+# ============================================================================
+# WEATHER
+# ============================================================================
+
 KNOWN_LOCATIONS = {
     "claxton": (32.1710, -81.9034, "US"),
     "claxton, ga": (32.1710, -81.9034, "US"),
@@ -47,95 +428,6 @@ KNOWN_LOCATIONS = {
     "kiev": (50.4501, 30.5234, "intl"),
 }
 
-# ============================================================================
-# ADDRESS OVERRIDES — manually verified corrections
-# ============================================================================
-ADDRESS_OVERRIDES = {
-    "texaco claxton ga": "601 W Main St, Claxton, GA 30417 (verified by Sharar, overrides map data)",
-}
-
-# ============================================================================
-# INIT
-# ============================================================================
-client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
-st.set_page_config(page_title="Laozi's Bar", page_icon="🍶")
-st.title("🍶 Laozi's Bar (Shifu)")
-
-# ============================================================================
-# TOOL DEFINITIONS
-# ============================================================================
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_web",
-            "description": (
-                "Search the web for information. Use for factual queries, recent events, "
-                "news, or anything you're unsure about that ISN'T weather or a place's address "
-                "(use get_weather or get_address for those instead — they're more reliable). "
-                "CRITICAL: results may be stale or cached. If results lack a recent date or "
-                "timestamp, tell the user the data may be outdated rather than presenting it as fact."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query."}
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": (
-                "Get current, real, live weather/temperature for a specific place. "
-                "ALWAYS use this instead of search_web for any weather or temperature question — "
-                "search results for weather are frequently stale and wrong. "
-                "Provide a location name (city, region, or 'City, Country')."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {
-                        "type": "string",
-                        "description": "Place name, e.g. 'Claxton, GA' or 'Kyiv, Ukraine'",
-                    }
-                },
-                "required": ["location"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_address",
-            "description": (
-                "Look up the verified street address of a specific named place (a business, "
-                "landmark, or point of interest) using a geocoding database. "
-                "ALWAYS use this instead of search_web for address questions — search snippets "
-                "frequently attach the wrong address to the wrong business. "
-                "Provide the specific name of the place plus city/state for accuracy, "
-                "e.g. 'Ace Hardware, Claxton GA', not just 'the hardware store'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "place_query": {
-                        "type": "string",
-                        "description": "Name and location of the place, as specific as possible.",
-                    }
-                },
-                "required": ["place_query"],
-            },
-        },
-    },
-]
-
-# ============================================================================
-# WEATHER (Open-Meteo, free, no API key)
-# ============================================================================
 WEATHER_CODES = {
     0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
     45: "Fog", 48: "Depositing rime fog",
@@ -148,7 +440,6 @@ WEATHER_CODES = {
 
 
 def geocode_location(location_str):
-    """Fallback geocoder for locations not in KNOWN_LOCATIONS, via Nominatim."""
     try:
         r = requests.get(
             "https://nominatim.openstreetmap.org/search",
@@ -160,12 +451,12 @@ def geocode_location(location_str):
         if not results:
             return None
         return float(results[0]["lat"]), float(results[0]["lon"])
-    except Exception:
+    except Exception as e:
+        log.warning(f"Geocode failed: {e}")
         return None
 
 
 def get_weather(location):
-    """Fetch live weather from Open-Meteo. Returns formatted string."""
     key = location.strip().lower()
     region = "intl"
 
@@ -190,6 +481,7 @@ def get_weather(location):
             timeout=10,
         )
         data = r.json()["current"]
+
         temp_c = data["temperature_2m"]
         temp_f = temp_c * 9 / 5 + 32
         condition = WEATHER_CODES.get(data["weather_code"], "Unknown conditions")
@@ -208,42 +500,47 @@ def get_weather(location):
             f"Conditions: {condition}\n"
             f"Humidity: {humidity}%\n"
             f"Wind: {wind} km/h\n"
-            f"Source: Open-Meteo (live API, not a search snippet)."
+            f"Source: Open-Meteo live API."
         )
     except Exception as e:
         return f"Weather lookup failed: {e}"
 
 
 # ============================================================================
-# ADDRESS LOOKUP (Nominatim, free, no API key — with manual overrides)
+# ADDRESS LOOKUP
 # ============================================================================
 
+ADDRESS_OVERRIDES = {
+    "texaco claxton ga": "601 W Main St, Claxton, GA 30417 (verified by Sharar, overrides map data)",
+}
+
+
 def get_address(place_query):
-    """Verified address lookup — checks manual overrides first, then Nominatim."""
-    # --- Token-based matching against ADDRESS_OVERRIDES ---
     query_tokens = set(place_query.strip().lower().replace(",", " ").split())
 
     for key, addr in ADDRESS_OVERRIDES.items():
         key_tokens = set(key.replace(",", " ").split())
         if key_tokens.issubset(query_tokens):
-            return f"VERIFIED ADDRESS (manually confirmed override): {addr}"
+            return f"VERIFIED ADDRESS, manually confirmed override: {addr}"
 
-    # --- Fallback: Nominatim geocoding ---
     try:
         r = requests.get(
             "https://nominatim.openstreetmap.org/search",
-            params={"q": place_query, "format": "json", "limit": 3, "addressdetails": 1},
+            params={
+                "q": place_query,
+                "format": "json",
+                "limit": 3,
+                "addressdetails": 1
+            },
             headers={"User-Agent": "laozis-bar-address-tool/1.0"},
             timeout=10,
         )
         results = r.json()
+
         if not results:
             return (
-                f"No verified address found for '{place_query}' in the geocoding database. "
-                "DO NOT fall back to search_web for this — general web search frequently "
-                "attaches the wrong address to the wrong business (this has happened before). "
-                "Tell the user directly that the address could not be verified and suggest "
-                "they check Google Maps or call the business directly."
+                f"No verified address found for '{place_query}' in OpenStreetMap/Nominatim. "
+                "Do not guess. Tell the user the address could not be verified."
             )
 
         formatted = []
@@ -251,25 +548,62 @@ def get_address(place_query):
             formatted.append(f"- {item.get('display_name')}")
 
         return (
-            f"VERIFIED ADDRESS LOOKUP for '{place_query}' (source: OpenStreetMap/Nominatim):\n"
+            f"VERIFIED ADDRESS LOOKUP for '{place_query}' "
+            f"(source: OpenStreetMap/Nominatim):\n"
             + "\n".join(formatted)
-            + "\n\nIf multiple results appear, confirm with the user which one matches "
-            "before stating it as fact. If none clearly match, say so instead of guessing."
+            + "\n\nIf multiple results appear, ask which one matches."
         )
     except Exception as e:
         return f"Address lookup failed: {e}"
 
 
 # ============================================================================
-# SEARCH — dual-method: raw HTTP first, ddgs library fallback
+# SEARCH
 # ============================================================================
 
-def search_web_raw(query, max_results=5):
-    """
-    Primary search method: raw HTTP request to DuckDuckGo's HTML endpoint.
-    Looks like a regular browser — harder to rate-limit than the ddgs library.
-    Returns results string or None if this method failed.
-    """
+def freshness_label(title, snippet):
+    current_year = str(datetime.now().year)
+    current_month = datetime.now().strftime("%B").lower()
+    text = f"{title} {snippet}".lower()
+
+    if any(word in text for word in ["today", "live", "updated", "now", "minutes ago", "hours ago"]):
+        return "LIKELY FRESH"
+    if current_month in text and current_year in text:
+        return "PROBABLY RECENT"
+    if current_year in text:
+        return "MAY BE CURRENT"
+    return "FRESHNESS UNKNOWN"
+
+
+def format_search_results(results, source_name):
+    if not results:
+        return None
+
+    today = datetime.now().strftime("%B %d, %Y")
+    cards = []
+
+    for i, r in enumerate(results, 1):
+        title = r.get("title", "No title")
+        href = r.get("href", "No URL")
+        body = r.get("body", "No snippet")
+        fresh = freshness_label(title, body)
+
+        cards.append(
+            f"--- Result {i} ---\n"
+            f"Freshness: {fresh}\n"
+            f"Title: {title}\n"
+            f"URL: {href}\n"
+            f"Snippet: {body}"
+        )
+
+    return (
+        "\n\n".join(cards)
+        + f"\n\nSearch completed: {today}\n"
+        + f"Source: {source_name}"
+    )
+
+
+def duckduckgo_raw_search(query, max_results=5):
     try:
         r = requests.get(
             "https://html.duckduckgo.com/html/",
@@ -278,9 +612,7 @@ def search_web_raw(query, max_results=5):
                 "User-Agent": (
                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
+                )
             },
             timeout=15,
         )
@@ -288,316 +620,345 @@ def search_web_raw(query, max_results=5):
         if r.status_code != 200:
             return None
 
-        html = r.text
+        soup = BeautifulSoup(r.text, "html.parser")
+        results = []
 
-        # Pattern 1: standard DuckDuckGo HTML results
-        result_blocks = re.findall(
-            r'<a rel="nofollow" class="result__a" href="([^"]+)"[^>]*>(.*?)</a>'
-            r'.*?<a class="result__snippet"[^>]*>(.*?)</a>',
-            html,
-            re.DOTALL,
-        )
+        for block in soup.select(".result"):
+            title_el = block.select_one(".result__a")
+            snippet_el = block.select_one(".result__snippet")
 
-        # Pattern 2: alternative layout
-        if not result_blocks:
-            result_blocks = re.findall(
-                r'class="result__title"[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>'
-                r'.*?class="result__snippet"[^>]*>(.*?)</',
-                html,
-                re.DOTALL,
-            )
-
-        # Pattern 3: even more lenient — grab links with snippets nearby
-        if not result_blocks:
-            links = re.findall(
-                r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
-                html,
-                re.DOTALL,
-            )
-            snippets = re.findall(
-                r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
-                html,
-                re.DOTALL,
-            )
-            if links and snippets and len(links) == len(snippets):
-                result_blocks = [
-                    (url, title, snippet)
-                    for (url, title), snippet in zip(links, snippets)
-                ]
-
-        if not result_blocks:
-            return None
-
-        today_str = datetime.now().strftime("%B %d, %Y")
-        current_year = str(datetime.now().year)
-        current_month = datetime.now().strftime("%B")
-
-        formatted = []
-        for i, block in enumerate(result_blocks[:max_results], 1):
-            url, title, snippet = block[0], block[1], block[2]
-
-            title_clean = re.sub(r'<[^>]+>', '', title).strip()
-            snippet_clean = re.sub(r'<[^>]+>', '', snippet).strip()
-
-            if not title_clean and not snippet_clean:
+            if not title_el:
                 continue
 
-            mentions_current_year = current_year in snippet_clean or current_year in title_clean
-            mentions_current_month = current_month in snippet_clean or current_month in title_clean
-            mentions_today = any(
-                word in snippet_clean.lower()
-                for word in [
-                    "today", "current", "now", "live", "updated",
-                    "just now", "minutes ago", "hour ago",
-                ]
-            )
+            title = title_el.get_text(" ", strip=True)
+            href = title_el.get("href", "")
+            snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
 
-            if mentions_today:
-                freshness = "🟢 LIKELY FRESH"
-            elif mentions_current_month and mentions_current_year:
-                freshness = "🟡 PROBABLY RECENT"
-            elif mentions_current_year:
-                freshness = "🟠 MAY BE CURRENT"
-            else:
-                freshness = "🔴 FRESHNESS UNKNOWN"
+            if title:
+                results.append({
+                    "title": html.unescape(title),
+                    "href": html.unescape(href),
+                    "body": html.unescape(snippet),
+                })
 
-            card = (
-                f"--- Result {i} ---\n"
-                f"FRESHNESS: {freshness}\n"
-                f"Title: {title_clean}\n"
-                f"URL: {url}\n"
-                f"Snippet: {snippet_clean}\n"
-            )
-            formatted.append(card)
+            if len(results) >= max_results:
+                break
 
-        if formatted:
-            return (
-                "\n\n".join(formatted)
-                + f"\n==========\nSEARCH COMPLETED: {today_str}\n"
-                "Source: DuckDuckGo (raw HTTP)"
-            )
-
-        return None
-
-    except Exception:
+        return results or None
+    except Exception as e:
+        log.warning(f"Raw DuckDuckGo search failed: {e}")
         return None
 
 
-def search_web_ddgs(query, max_results=5):
-    """
-    Fallback search method: uses the ddgs library (actively maintained fork).
-    Returns results string or None if this method failed.
-    """
-    max_retries = 2
-    for attempt in range(max_retries):
-        try:
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=max_results))
-            if not results:
-                return None
+def ddgs_search(query, max_results=5, timelimit=None):
+    try:
+        kwargs = {
+            "max_results": max_results,
+            "backend": "lite",
+        }
+        if timelimit:
+            kwargs["timelimit"] = timelimit
 
-            today_str = datetime.now().strftime("%B %d, %Y")
-            current_year = str(datetime.now().year)
-            current_month = datetime.now().strftime("%B")
+        results = list(DDGS().text(query, **kwargs))
+        return results or None
+    except Exception as e:
+        log.warning(f"DDGS search failed: {e}")
+        return None
 
-            formatted = []
-            for i, r in enumerate(results, 1):
-                title = r.get("title", "No title")
-                href = r.get("href", "")
-                snippet = r.get("body", "")
 
-                mentions_current_year = current_year in snippet or current_year in title
-                mentions_current_month = current_month in snippet or current_month in title
-                mentions_today = any(
-                    word in snippet.lower()
-                    for word in [
-                        "today", "current", "now", "live", "updated",
-                        "just now", "minutes ago", "hour ago",
-                    ]
-                )
+def search_recent_news(query):
+    results = ddgs_search(query, max_results=5, timelimit="w")
+    formatted = format_search_results(results, "DuckDuckGo/DDGS, 7-day filter")
+    if formatted:
+        return formatted[:MAX_TOOL_RESULT_CHARS]
 
-                if mentions_today:
-                    freshness = "🟢 LIKELY FRESH"
-                elif mentions_current_month and mentions_current_year:
-                    freshness = "🟡 PROBABLY RECENT"
-                elif mentions_current_year:
-                    freshness = "🟠 MAY BE CURRENT"
-                else:
-                    freshness = "🔴 FRESHNESS UNKNOWN"
+    results = duckduckgo_raw_search(query, max_results=5)
+    formatted = format_search_results(results, "DuckDuckGo raw HTML fallback")
+    if formatted:
+        return (
+            formatted
+            + "\n\nWARNING: Raw fallback search has no strict recency filter. Treat freshness cautiously."
+        )[:MAX_TOOL_RESULT_CHARS]
 
-                card = (
-                    f"--- Result {i} of {len(results)} ---\n"
-                    f"FRESHNESS: {freshness}\n"
-                    f"Title: {title}\n"
-                    f"URL: {href}\n"
-                    f"Snippet: {snippet}\n"
-                )
-                formatted.append(card)
+    return "Recent news search failed or returned no usable results."
 
-            return (
-                "\n\n".join(formatted)
-                + f"\n==========\nSEARCH COMPLETED: {today_str}\n"
-                "Source: DuckDuckGo (ddgs library)"
-            )
 
-        except Exception:
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
+def search_general_web(query):
+    results = duckduckgo_raw_search(query, max_results=5)
+    formatted = format_search_results(results, "DuckDuckGo raw HTML")
+    if formatted:
+        return formatted[:MAX_TOOL_RESULT_CHARS]
+
+    results = ddgs_search(query, max_results=5)
+    formatted = format_search_results(results, "DuckDuckGo/DDGS fallback")
+    if formatted:
+        return formatted[:MAX_TOOL_RESULT_CHARS]
+
+    return "General web search failed or returned no usable results."
+
+
+# ============================================================================
+# URL AND YOUTUBE EXTRACTION
+# ============================================================================
+
+def normalize_url(url):
+    return url.strip().rstrip(".,)]}>\"'")
+
+
+def extract_youtube_id(url):
+    patterns = [
+        r"(?:v=)([0-9A-Za-z_-]{11})",
+        r"(?:youtu\.be/)([0-9A-Za-z_-]{11})",
+        r"(?:embed/)([0-9A-Za-z_-]{11})",
+        r"(?:shorts/)([0-9A-Za-z_-]{11})",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
 
     return None
 
 
-def search_web(query, max_results=5):
-    """
-    Search DuckDuckGo with dual-method fallback:
-    1. Try raw HTTP request first (harder to rate-limit, looks like a browser).
-    2. Fall back to the ddgs library (actively maintained).
-    3. If both fail, return an honest error message.
-    """
-    # --- Method 1: Raw HTTP ---
-    result = search_web_raw(query, max_results)
-    if result is not None:
-        return result
+def get_youtube_transcript(video_id):
+    try:
+        transcript = youtube_transcript_api.YouTubeTranscriptApi.get_transcript(video_id)
+        text = " ".join(item.get("text", "") for item in transcript)
+        return text[:MAX_LINK_CHARS]
+    except Exception as e:
+        log.warning(f"YouTube transcript failed for {video_id}: {e}")
+        return f"[Transcript unavailable: {e}]"
 
-    # --- Method 2: ddgs library ---
-    result = search_web_ddgs(query, max_results)
-    if result is not None:
-        return result
 
-    # --- Both failed ---
-    return (
-        "SEARCH FAILED: Both search methods (raw HTTP and ddgs library) "
-        "returned no results.\n"
-        "DuckDuckGo may be rate-limiting or temporarily unavailable. "
-        "Try again in 30-60 seconds, or provide what you already know "
-        "with a clear caveat that the information is unverified."
-    )
+def is_safe_url(url):
+    try:
+        parsed = urlparse(url)
+
+        if parsed.scheme not in {"http", "https"}:
+            return False
+
+        host = parsed.hostname
+        if not host:
+            return False
+
+        resolved = socket.getaddrinfo(host, None)
+
+        for result in resolved:
+            ip = result[4][0]
+            ip_obj = ipaddress.ip_address(ip)
+
+            if (
+                ip_obj.is_loopback
+                or ip_obj.is_private
+                or ip_obj.is_link_local
+                or ip_obj.is_multicast
+                or ip_obj.is_reserved
+                or ip_obj.is_unspecified
+            ):
+                return False
+
+        return True
+    except Exception as e:
+        log.warning(f"URL safety check failed for {url}: {e}")
+        return False
+
+
+def extract_webpage_text(url):
+    if not is_safe_url(url):
+        return "[Access denied: URL points to a restricted or unsafe network destination.]"
+
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=12
+        )
+        r.raise_for_status()
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        for element in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            element.decompose()
+
+        text = soup.get_text(separator="\n")
+        lines = [line.strip() for line in text.splitlines()]
+        clean = "\n".join(line for line in lines if line)
+
+        return clean[:MAX_LINK_CHARS]
+    except Exception as e:
+        log.warning(f"Webpage extraction failed for {url}: {e}")
+        return f"[Article extraction failed: {e}]"
+
+
+def process_links(user_text):
+    urls = re.findall(r"https?://\S+", user_text)
+    if not urls:
+        return ""
+
+    blocks = ["\n\n=== SHARED LINK INTELLIGENCE ==="]
+
+    for raw in urls:
+        url = normalize_url(raw)
+
+        if "youtube.com" in url or "youtu.be" in url:
+            video_id = extract_youtube_id(url)
+            if video_id:
+                transcript = get_youtube_transcript(video_id)
+                blocks.append(f"\n[YouTube Transcript: {url}]\n{transcript}")
+            else:
+                blocks.append(f"\n[YouTube link detected, but no video ID extracted: {url}]")
+        else:
+            text = extract_webpage_text(url)
+            blocks.append(f"\n[Article/Text Extract: {url}]\n{text}")
+
+    blocks.append("\n=== END SHARED LINK INTELLIGENCE ===")
+    return "\n".join(blocks)
 
 
 # ============================================================================
-# PERSISTENCE
+# TOOL SCHEMAS AND TOOL LOOP
 # ============================================================================
 
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_recent_news",
+            "description": "Search recent news and current developments from roughly the last 7 days.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Specific recent-news query."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_general_web",
+            "description": "Search general web/background information, stable facts, definitions, and history.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "General web search query."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get live weather/temperature for a specific place. Use this for weather questions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City or place, e.g. Claxton, GA or Kyiv, Ukraine."}
+                },
+                "required": ["location"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_address",
+            "description": "Look up verified street addresses for named places. Use this for address/location questions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "place_query": {"type": "string", "description": "Specific place plus city/state/country."}
+                },
+                "required": ["place_query"],
+            },
+        },
+    },
+]
 
-
-def save_history(messages):
-    if len(messages) > MAX_STORED_MESSAGES:
-        messages = messages[-MAX_STORED_MESSAGES:]
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(messages, f, ensure_ascii=False, indent=2)
-    return messages
-
-
-def build_api_messages(messages):
-    """
-    Build the messages array for the API call.
-    PRESERVES all roles (user, assistant, tool, system) and all fields
-    (including tool_calls, tool_call_id, name).
-    Prepends the system prompt to anchor the bar's voice.
-    """
-    trimmed = [
-        m for m in messages
-        if m["role"] in ("user", "assistant", "tool", "system")
-    ]
-    windowed = trimmed[-(MAX_TURNS_SENT * 6):]
-    api_msgs = [dict(m) for m in windowed]
-    return [{"role": "system", "content": SYSTEM_PROMPT}] + api_msgs
-
-
-# ============================================================================
-# TOOL CALL HELPERS (SDK-agnostic)
-# ============================================================================
 
 def normalize_tool_call(tc, index=0):
-    """Handle Pydantic objects, plain dicts, or raw attributes. Always returns a clean dict."""
     if isinstance(tc, dict):
         return {
             "id": tc.get("id", f"call_{index}"),
             "type": tc.get("type", "function"),
             "function": {
-                "name": tc.get("function", {}).get("name", "search_web"),
+                "name": tc.get("function", {}).get("name", ""),
                 "arguments": tc.get("function", {}).get("arguments", "{}"),
             },
         }
+
     if hasattr(tc, "model_dump"):
         return tc.model_dump()
 
-    func_name = "search_web"
-    func_args = "{}"
-    tc_id = f"call_{index}"
+    tc_id = getattr(tc, "id", f"call_{index}")
+    func = getattr(tc, "function", None)
 
-    if hasattr(tc, "id"):
-        tc_id = tc.id
-    if hasattr(tc, "function"):
-        if hasattr(tc.function, "name"):
-            func_name = tc.function.name
-        elif isinstance(tc.function, dict):
-            func_name = tc.function.get("name", "search_web")
-        if hasattr(tc.function, "arguments"):
-            func_args = tc.function.arguments
-        elif isinstance(tc.function, dict):
-            func_args = tc.function.get("arguments", "{}")
+    if func is None:
+        return {
+            "id": tc_id,
+            "type": "function",
+            "function": {"name": "", "arguments": "{}"},
+        }
+
+    name = getattr(func, "name", "")
+    args = getattr(func, "arguments", "{}")
 
     return {
         "id": tc_id,
         "type": "function",
-        "function": {"name": func_name, "arguments": func_args},
+        "function": {"name": name, "arguments": args},
     }
 
 
 def extract_func_info(tc):
-    """Extract function name and arguments from a tool_call, whatever shape it is."""
     if isinstance(tc, dict):
         func = tc.get("function", {})
-        return func.get("name", "search_web"), func.get("arguments", "{}")
-    if hasattr(tc, "function"):
-        if hasattr(tc.function, "name"):
-            return tc.function.name, tc.function.arguments
-        elif isinstance(tc.function, dict):
-            return tc.function.get("name", "search_web"), tc.function.get("arguments", "{}")
-    return "search_web", "{}"
+        return func.get("name", ""), func.get("arguments", "{}")
+
+    func = getattr(tc, "function", None)
+    if func is None:
+        return "", "{}"
+
+    return getattr(func, "name", ""), getattr(func, "arguments", "{}")
 
 
 def get_tc_id(tc, index=0):
-    """Extract tool_call id, whatever shape it is."""
     if isinstance(tc, dict):
         return tc.get("id", f"call_{index}")
-    if hasattr(tc, "id"):
-        return tc.id
-    return f"call_{index}"
+    return getattr(tc, "id", f"call_{index}")
 
 
 def dispatch_tool_call(func_name, func_args_str):
-    """Routes a tool call to the right function based on name."""
     try:
-        args = json.loads(func_args_str)
+        args = json.loads(func_args_str or "{}")
     except json.JSONDecodeError:
         args = {}
 
-    if func_name == "search_web":
-        return search_web(args.get("query", func_args_str))
-    elif func_name == "get_weather":
+    if func_name == "search_recent_news":
+        return search_recent_news(args.get("query", ""))
+
+    if func_name == "search_general_web":
+        return search_general_web(args.get("query", ""))
+
+    if func_name == "get_weather":
         return get_weather(args.get("location", ""))
-    elif func_name == "get_address":
+
+    if func_name == "get_address":
         return get_address(args.get("place_query", ""))
-    else:
-        return f"Unknown tool: {func_name}"
 
+    return f"Unknown tool: {func_name}"
 
-# ============================================================================
-# FORCED TOOL DETECTION (code-level override, not model-dependent)
-# ============================================================================
 
 ADDRESS_KEYWORDS = (
     "address", "located at", "where is", "where's", "wheres",
     "what's the location", "location of", "find the address",
     "directions to", "how do i get to",
 )
+
 WEATHER_KEYWORDS = (
     "temperature", "weather", "how hot", "how cold",
     "degrees outside", "what's it like outside",
@@ -607,42 +968,71 @@ WEATHER_KEYWORDS = (
 
 
 def detect_forced_tool(user_text):
-    """
-    Code-level override: don't trust the model to pick the right tool.
-    If the latest user message smells like an address or weather question,
-    force that specific tool on the first hop so search_web can't quietly
-    substitute in with stale/wrong data.
-    """
     text = user_text.lower().replace("'", "")
 
     if any(k in text for k in ADDRESS_KEYWORDS):
         return "get_address"
+
     if any(k in text for k in WEATHER_KEYWORDS):
         return "get_weather"
+
     return None
 
 
 # ============================================================================
-# COMPLETION LOOP
+# API MESSAGE BUILDING
 # ============================================================================
 
+def build_api_messages(user_runtime_input, current_message_id=None):
+    relevant_memory = search_memory(
+        user_runtime_input,
+        limit=MAX_MEMORY_RESULTS,
+        exclude_message_id=current_message_id,
+    )
+
+    memory_block = ""
+    if relevant_memory:
+        memory_block = (
+            "\n\n[RELEVANT LONG-TERM MEMORY]\n"
+            f"{relevant_memory}\n"
+            "[END RELEVANT LONG-TERM MEMORY]\n"
+            "Use this only if it helps. Do not recite it mechanically.\n"
+        )
+
+    system = SYSTEM_PROMPT + memory_block
+
+    recent_history = get_recent_api_history(
+        limit=MAX_RECENT_TURNS,
+        before_id=current_message_id,
+    )
+
+    return [
+        {"role": "system", "content": system},
+        *recent_history,
+        {"role": "user", "content": user_runtime_input},
+    ]
+
+
 def run_completion_with_tools(api_messages):
-    """Handles the tool-call loop. Returns final text reply."""
     messages = list(api_messages)
     max_hops = 5
     seen_calls = set()
 
     last_user_text = ""
     for m in reversed(messages):
-        if m["role"] == "user":
+        if m.get("role") == "user":
             last_user_text = m.get("content", "")
             break
+
     forced_tool = detect_forced_tool(last_user_text)
 
     for hop in range(max_hops):
         tool_choice_param = "auto"
         if forced_tool and hop == 0:
-            tool_choice_param = {"type": "function", "function": {"name": forced_tool}}
+            tool_choice_param = {
+                "type": "function",
+                "function": {"name": forced_tool},
+            }
 
         response = client.chat.completions.create(
             model=MODEL,
@@ -651,78 +1041,147 @@ def run_completion_with_tools(api_messages):
             tool_choice=tool_choice_param,
             extra_body={"thinking": {"type": "disabled"}},
         )
+
         msg = response.choices[0].message
 
         if not msg.tool_calls:
-            return msg.content or "(No response from model)"
+            return msg.content or "(No response from model.)"
 
-        all_duplicates = True
+        normalized_calls = [
+            normalize_tool_call(tc, index=i)
+            for i, tc in enumerate(msg.tool_calls)
+        ]
+
+        duplicate_count = 0
         for tc in msg.tool_calls:
             func_name, func_args_str = extract_func_info(tc)
-            call_signature = (func_name, func_args_str)
-            if call_signature not in seen_calls:
-                all_duplicates = False
-                seen_calls.add(call_signature)
+            signature = (func_name, func_args_str)
+            if signature in seen_calls:
+                duplicate_count += 1
+            else:
+                seen_calls.add(signature)
 
-        if all_duplicates and hop >= 1:
-            return (
-                "(I already made those exact calls. Let me work with the results I have "
-                "rather than repeating them.)"
-            )
+        if duplicate_count == len(msg.tool_calls) and hop >= 1:
+            return "(Shifu already checked those shelves. The same search again will not make the bottle fuller.)"
 
         messages.append({
             "role": "assistant",
             "content": msg.content or "",
-            "tool_calls": [
-                normalize_tool_call(tc, index=i)
-                for i, tc in enumerate(msg.tool_calls)
-            ],
+            "tool_calls": normalized_calls,
         })
 
         for i, tc in enumerate(msg.tool_calls):
             func_name, func_args_str = extract_func_info(tc)
             result = dispatch_tool_call(func_name, func_args_str)
+
+            tool_memory = (
+                f"Tool used: {func_name}\n"
+                f"Arguments: {func_args_str}\n"
+                f"Result:\n{result[:MAX_TOOL_RESULT_CHARS]}"
+            )
+            append_message("tool_memory", tool_memory, visible=False)
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": get_tc_id(tc, index=i),
-                "content": result,
+                "name": func_name,
+                "content": result[:MAX_TOOL_RESULT_CHARS],
             })
 
-    return "(Search loop exceeded max hops — model kept calling tools.)"
+    return "(Tool loop exceeded maximum hops. Shifu stops before the machine starts chewing its own tail.)"
 
 
 # ============================================================================
-# STREAMLIT UI
+# STARTUP DATABASE INIT
 # ============================================================================
 
-if "messages" not in st.session_state:
-    st.session_state.messages = load_history()
-if "session_start_index" not in st.session_state:
-    st.session_state.session_start_index = len(st.session_state.messages)
+init_db()
+migrate_legacy_history_once()
 
-with st.expander("📜 View full chat archive (older turns aren't sent to the API)"):
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.write(msg.get("content", ""))
 
-for msg in st.session_state.messages[st.session_state.session_start_index:]:
-    with st.chat_message(msg["role"]):
-        st.write(msg.get("content", ""))
+# ============================================================================
+# SIDEBAR MEMORY TOOLS
+# ============================================================================
+
+with st.sidebar:
+    st.header("Memory")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM messages")
+    total_messages = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM messages WHERE visible = 1")
+    visible_messages = cur.fetchone()[0]
+    conn.close()
+
+    st.metric("Stored records", total_messages)
+    st.metric("Visible chat turns", visible_messages)
+
+    memory_query = st.text_input("Search memory")
+    if memory_query:
+        result = search_memory(memory_query, limit=10)
+        if result:
+            st.text_area("Memory hits", result, height=300)
+        else:
+            st.write("No memory hit.")
+
+    st.download_button(
+        "Download visible archive JSON",
+        data=export_archive_json(),
+        file_name="shifu_visible_archive.json",
+        mime="application/json",
+    )
+
+
+# ============================================================================
+# CHAT DISPLAY
+# ============================================================================
+
+if "session_start_id" not in st.session_state:
+    st.session_state.session_start_id = get_last_visible_id()
+
+with st.expander("📜 View full visible chat archive"):
+    for msg_id, role, content, created_at in fetch_visible_messages():
+        with st.chat_message(role):
+            st.caption(created_at)
+            st.write(content)
+
+for msg_id, role, content, created_at in fetch_visible_messages(
+    after_id=st.session_state.session_start_id
+):
+    with st.chat_message(role):
+        st.write(content)
+
+
+# ============================================================================
+# CHAT INPUT
+# ============================================================================
 
 if prompt := st.chat_input("Ask Shifu anything..."):
     with st.chat_message("user"):
         st.write(prompt)
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    st.session_state.messages = save_history(st.session_state.messages)
+
+    current_msg_id = append_message("user", prompt, visible=True)
+
+    link_intel = process_links(prompt)
+    if link_intel:
+        append_message("link_memory", link_intel, visible=False)
+        runtime_input = prompt + "\n\n" + link_intel
+    else:
+        runtime_input = prompt
 
     with st.chat_message("assistant"):
-        with st.spinner("Shifu is thinking (and maybe searching)..."):
-            api_messages = build_api_messages(st.session_state.messages)
+        with st.spinner("Shifu is thinking, searching, or pretending not to care..."):
             try:
+                api_messages = build_api_messages(
+                    user_runtime_input=runtime_input,
+                    current_message_id=current_msg_id,
+                )
                 reply = run_completion_with_tools(api_messages)
             except Exception as e:
+                log.error(f"DeepSeek call failed: {e}")
                 reply = f"(Error talking to DeepSeek: {e})"
+
             st.write(reply)
 
-    st.session_state.messages.append({"role": "assistant", "content": reply})
-    st.session_state.messages = save_history(st.session_state.messages)
+    append_message("assistant", reply, visible=True)
