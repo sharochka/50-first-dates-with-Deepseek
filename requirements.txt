@@ -1,0 +1,6 @@
+streamlit
+openai
+requests
+beautifulsoup4
+ddgs
+youtube-transcript-api
