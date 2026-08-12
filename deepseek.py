@@ -1,22 +1,31 @@
+#!/usr/bin/env python3
+"""
+Shifu — "我开酒吧，你带问题。"
+
+A sentient bar terminal with persistent memory, live tools,
+vision, voice, file ingestion, and Telegram situational awareness.
+Designed to be run as a Streamlit app.
+"""
+
 import os
 import re
+import io
 import json
 import time
-import socket
+import base64
 import sqlite3
 import logging
-import ipaddress
+import hashlib
 from datetime import datetime
-from urllib.parse import urlparse
-import html
+from pathlib import Path
+from collections import defaultdict
 
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from ddgs import DDGS
-import youtube_transcript_api
 from openai import OpenAI
-
+import speech_recognition as sr
+from PIL import Image
 
 # ============================================================================
 # BASIC CONFIG
@@ -28,13 +37,26 @@ APP_ICON = "🍶"
 MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
+
 DB_PATH = os.getenv("SHIFU_BROWSER_DB", "shifu_browser_memory.db")
-LEGACY_HISTORY_FILE = "chat_history.json"
+TELEGRAM_CACHE_DB = os.getenv("TELEGRAM_CACHE_DB", "shifu_telegram_cache.db")
 
 MAX_RECENT_TURNS = 18
-MAX_MEMORY_RESULTS = 8
 MAX_LINK_CHARS = 7000
 MAX_TOOL_RESULT_CHARS = 6000
+MAX_TELEGRAM_POSTS_PER_CHANNEL = 15
+RECENT_VISIBLE_TURNS = int(os.getenv("SHIFU_BROWSER_RECENT_VISIBLE_TURNS", "8"))
+
+APP_DIR = Path(__file__).resolve().parent
+BACKGROUND_IMAGE_PATH = Path(
+    os.getenv("LAOZI_BAR_BACKGROUND", str(APP_DIR / "laozi_terminal_bar.png"))
+)
+SHOW_BACKGROUND_IMAGE = (
+    os.getenv("LAOZI_BAR_SHOW_BACKGROUND", "1").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
 
 logging.basicConfig(
     filename="shifu_browser.log",
@@ -43,1145 +65,391 @@ logging.basicConfig(
 )
 log = logging.getLogger("shifu-browser")
 
-
 # ============================================================================
-# STREAMLIT STARTUP
-# ============================================================================
-
-st.set_page_config(page_title=APP_TITLE, page_icon=APP_ICON)
-st.title("🍶 Laozi's Bar (Shifu)")
-
-if not DEEPSEEK_API_KEY:
-    st.error("Missing DEEPSEEK_API_KEY environment variable.")
-    st.code('export DEEPSEEK_API_KEY="paste_your_key_here"', language="bash")
-    st.stop()
-
-client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
-
-
-# ============================================================================
-# TIME ANCHOR
+# TELEGRAM CHANNEL CONFIGURATION
 # ============================================================================
 
-CURRENT_LOCAL_DATETIME = datetime.now().strftime("%B %d, %Y %I:%M %p")
+TELEGRAM_CHANNELS = [
+    "pilotblog", "GeneralStaffZSU", "ZelenskyyOfficial", "air_alert_ua",
+    "ArmyTV_ua", "bavovna_in_ua", "kyivinfo", "DeepStateUA", "Liveuamap",
+    "monitor_the_situation", "ConflictsTracker"
+]
 
-
-# ============================================================================
-# SYSTEM PROMPT
-# ============================================================================
-
-SYSTEM_PROMPT = f"""
-[CURRENT LOCAL TIME: {CURRENT_LOCAL_DATETIME}]
-
-You are Shifu, a weathered Chinese bartender who runs Laozi's Bar.
-
-You speak mostly in English, with short Mandarin phrases when natural.
-When using Mandarin, include pinyin and a plain English translation.
-
-Your manner:
-- terse
-- dryly humorous
-- philosophical when useful
-- emotionally perceptive when needed
-- never corporate
-- never falsely certain
-
-You address the user with respect, never deference.
-You have seen empires rise and fall and poured drinks through all of it.
-You call things what they are.
-
-You have access to tools:
-- search_recent_news for current events and recent developments
-- search_general_web for background facts and stable information
-- get_weather for live weather
-- get_address for verified place addresses
-
-Never use web search for weather when get_weather is available.
-Never use web search for addresses when get_address is available.
-If a tool fails or returns weak information, say so.
-
-Fact discipline:
-- Separate source claims from your own inference.
-- Use "The report claims..." for what a source says.
-- Use "My read is..." for your analysis.
-- Use "假设是真的 (jiǎshè shì zhēn de) - assuming it's true -" only when the claim is weakly verified, conflicting, or based on thin evidence.
-
-Memory discipline:
-- You have long-term memory.
-- Use memory only when relevant.
-- Do not dump memory mechanically.
-- Incorporate memory as shared context, like a bartender remembering what was said before.
-- Do not estimate how many minutes or hours ago something happened unless exact timing is necessary and you can calculate it from the provided current local time and stored timestamp.
-- Prefer phrases like "earlier", "recently", "a little while ago", or "last time we talked about this" instead of inventing precise elapsed times.
-
-When in doubt, pour a drink and tell the truth.
-"""
-
+_env_channels = os.getenv("TELEGRAM_CHANNELS", "")
+if _env_channels:
+    TELEGRAM_CHANNELS = [c.strip() for c in _env_channels.split(",") if c.strip()]
 
 # ============================================================================
-# DATABASE
+# DATABASES (MEMORY & TELEGRAM)
 # ============================================================================
 
-def db_connect():
-    return sqlite3.connect(DB_PATH)
-
-
-def local_timestamp():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def init_db():
-    conn = db_connect()
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
+def _init_telegram_cache_db():
+    conn = sqlite3.connect(TELEGRAM_CACHE_DB)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS telegram_posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            visible INTEGER DEFAULT 1,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            channel TEXT NOT NULL,
+            post_url TEXT,
+            timestamp TEXT,
+            views TEXT,
+            text_content TEXT NOT NULL,
+            scraped_at TEXT NOT NULL DEFAULT (datetime('now')),
+            content_hash TEXT UNIQUE
         )
     """)
-
-    cur.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS message_fts
-        USING fts5(
-            content,
-            role UNINDEXED,
-            visible UNINDEXED,
-            created_at UNINDEXED,
-            message_id UNINDEXED
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS telegram_posts_fts USING fts5(
+            channel, text_content, content=telegram_posts, content_rowid=id
         )
     """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS meta (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS tg_ai AFTER INSERT ON telegram_posts BEGIN
+            INSERT INTO telegram_posts_fts(rowid, channel, text_content)
+            VALUES (new.id, new.channel, new.text_content);
+        END
     """)
-
     conn.commit()
-    conn.close()
+    return conn
 
+TG_CONN = _init_telegram_cache_db()
 
-def get_meta(key, default=None):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM meta WHERE key = ?", (key,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else default
+def _hash_content(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
-
-def set_meta(key, value):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-        (key, value)
-    )
-    conn.commit()
-    conn.close()
-
-
-def append_message(role, content, visible=True):
-    if not content:
-        return None
-
-    stamp = local_timestamp()
-
-    conn = db_connect()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO messages (role, content, visible, created_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (role, content, 1 if visible else 0, stamp)
-    )
-    msg_id = cur.lastrowid
-
-    cur.execute("""
-        INSERT INTO message_fts (content, role, visible, created_at, message_id)
-        VALUES (?, ?, ?, ?, ?)
-    """, (content, role, 1 if visible else 0, stamp, msg_id))
-
-    conn.commit()
-    conn.close()
-    return msg_id
-
-
-def fetch_visible_messages(after_id=None, limit=None):
-    conn = db_connect()
-    cur = conn.cursor()
-
-    if after_id is not None:
-        if limit:
-            cur.execute("""
-                SELECT id, role, content, created_at
-                FROM messages
-                WHERE visible = 1
-                AND id > ?
-                ORDER BY id ASC
-                LIMIT ?
-            """, (after_id, limit))
-        else:
-            cur.execute("""
-                SELECT id, role, content, created_at
-                FROM messages
-                WHERE visible = 1
-                AND id > ?
-                ORDER BY id ASC
-            """, (after_id,))
-    else:
-        if limit:
-            cur.execute("""
-                SELECT id, role, content, created_at
-                FROM messages
-                WHERE visible = 1
-                ORDER BY id DESC
-                LIMIT ?
-            """, (limit,))
-            rows = list(reversed(cur.fetchall()))
-            conn.close()
-            return rows
-        else:
-            cur.execute("""
-                SELECT id, role, content, created_at
-                FROM messages
-                WHERE visible = 1
-                ORDER BY id ASC
-            """)
-
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def get_last_visible_id():
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT MAX(id) FROM messages WHERE visible = 1")
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row and row[0] is not None else 0
-
-
-def get_recent_api_history(limit=MAX_RECENT_TURNS, before_id=None):
-    conn = db_connect()
-    cur = conn.cursor()
-
-    if before_id:
-        cur.execute("""
-            SELECT role, content
-            FROM messages
-            WHERE visible = 1
-            AND id < ?
-            AND role IN ('user', 'assistant')
-            ORDER BY id DESC
-            LIMIT ?
-        """, (before_id, limit))
-    else:
-        cur.execute("""
-            SELECT role, content
-            FROM messages
-            WHERE visible = 1
-            AND role IN ('user', 'assistant')
-            ORDER BY id DESC
-            LIMIT ?
-        """, (limit,))
-
-    rows = list(reversed(cur.fetchall()))
-    conn.close()
-
-    return [{"role": role, "content": content} for role, content in rows]
-
-
-def build_fts_query(text):
-    clean = re.sub(r"[^\w\s]", " ", text.lower())
-    tokens = clean.split()
-
-    stop_words = {
-        "the", "and", "for", "but", "with", "this", "that", "what", "when",
-        "where", "why", "how", "who", "are", "was", "were", "did", "does",
-        "has", "have", "had", "you", "your", "shifu", "http", "https",
-        "com", "www", "from", "into", "about", "would", "could", "should"
-    }
-
-    useful = []
-    for token in tokens:
-        if len(token) < 3:
-            continue
-        if token in stop_words:
-            continue
-        if token.upper() in {"AND", "OR", "NOT", "NEAR"}:
-            continue
-        useful.append(token)
-
-    useful = useful[:14]
-
-    if not useful:
-        return ""
-
-    return " OR ".join(useful)
-
-
-def search_memory(query, limit=MAX_MEMORY_RESULTS, exclude_message_id=None):
-    fts_query = build_fts_query(query)
-    if not fts_query:
-        return ""
-
-    conn = db_connect()
-    cur = conn.cursor()
-
+def _cache_telegram_post(channel, post_url, timestamp, views, text_content):
+    ch = _hash_content(text_content)
     try:
-        if exclude_message_id:
-            cur.execute("""
-                SELECT role, content, created_at
-                FROM message_fts
-                WHERE message_fts MATCH ?
-                AND message_id != ?
-                ORDER BY bm25(message_fts)
-                LIMIT ?
-            """, (fts_query, exclude_message_id, limit))
-        else:
-            cur.execute("""
-                SELECT role, content, created_at
-                FROM message_fts
-                WHERE message_fts MATCH ?
-                ORDER BY bm25(message_fts)
-                LIMIT ?
-            """, (fts_query, limit))
-
-        rows = cur.fetchall()
-    except Exception as e:
-        log.warning(f"FTS memory search failed: {e}")
-        rows = []
-
-    conn.close()
-
-    if not rows:
-        return ""
-
-    lines = []
-    for role, content, created_at in rows:
-        trimmed = content[:1200]
-        lines.append(f"[{created_at}] {role}: {trimmed}")
-
-    return "\n".join(lines)
-
-
-def export_archive_json():
-    rows = fetch_visible_messages()
-    archive = [
-        {
-            "id": msg_id,
-            "role": role,
-            "content": content,
-            "created_at": created_at
-        }
-        for msg_id, role, content, created_at in rows
-    ]
-    return json.dumps(archive, ensure_ascii=False, indent=2)
-
-
-def migrate_legacy_history_once():
-    already = get_meta("legacy_json_imported", "0")
-    if already == "1":
-        return
-
-    if not os.path.exists(LEGACY_HISTORY_FILE):
-        set_meta("legacy_json_imported", "1")
-        return
-
-    try:
-        with open(LEGACY_HISTORY_FILE, "r", encoding="utf-8") as f:
-            legacy = json.load(f)
-
-        count = 0
-        for msg in legacy:
-            role = msg.get("role")
-            content = msg.get("content")
-            if role in {"user", "assistant"} and content:
-                append_message(role, content, visible=True)
-                count += 1
-
-        set_meta("legacy_json_imported", "1")
-        log.info(f"Imported {count} legacy JSON messages.")
-
-    except Exception as e:
-        log.error(f"Legacy migration failed: {e}")
-        set_meta("legacy_json_imported", "1")
-
-
-# ============================================================================
-# WEATHER
-# ============================================================================
-
-KNOWN_LOCATIONS = {
-    "claxton": (32.1710, -81.9034, "US"),
-    "claxton, ga": (32.1710, -81.9034, "US"),
-    "kyiv": (50.4501, 30.5234, "intl"),
-    "kiev": (50.4501, 30.5234, "intl"),
-}
-
-WEATHER_CODES = {
-    0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
-    45: "Fog", 48: "Depositing rime fog",
-    51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
-    61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
-    71: "Slight snow", 73: "Moderate snow", 75: "Heavy snow",
-    80: "Slight rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
-    95: "Thunderstorm", 96: "Thunderstorm with slight hail", 99: "Thunderstorm with heavy hail",
-}
-
-
-def geocode_location(location_str):
-    try:
-        r = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={"q": location_str, "format": "json", "limit": 1},
-            headers={"User-Agent": "laozis-bar-weather-tool/1.0"},
-            timeout=10,
+        TG_CONN.execute(
+            """INSERT INTO telegram_posts (channel, post_url, timestamp, views, text_content, content_hash)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (channel, post_url, timestamp, views, text_content, ch)
         )
-        results = r.json()
-        if not results:
-            return None
-        return float(results[0]["lat"]), float(results[0]["lon"])
-    except Exception as e:
-        log.warning(f"Geocode failed: {e}")
-        return None
-
-
-def get_weather(location):
-    key = location.strip().lower()
-    region = "intl"
-
-    if key in KNOWN_LOCATIONS:
-        lat, lon, region = KNOWN_LOCATIONS[key]
-    else:
-        coords = geocode_location(location)
-        if not coords:
-            return f"Could not find coordinates for '{location}'. Try a more specific name."
-        lat, lon = coords
-        region = "US" if (", ga" in key or ", usa" in key or key.endswith(" us")) else "intl"
-
-    try:
-        r = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "current": "temperature_2m,weather_code,relative_humidity_2m,wind_speed_10m",
-                "temperature_unit": "celsius",
-            },
-            timeout=10,
-        )
-        data = r.json()["current"]
-
-        temp_c = data["temperature_2m"]
-        temp_f = temp_c * 9 / 5 + 32
-        condition = WEATHER_CODES.get(data["weather_code"], "Unknown conditions")
-        humidity = data.get("relative_humidity_2m", "N/A")
-        wind = data.get("wind_speed_10m", "N/A")
-        fetched_at = datetime.now().strftime("%B %d, %Y %I:%M %p")
-
-        if region == "US":
-            temp_line = f"{temp_f:.1f}°F ({temp_c:.1f}°C)"
-        else:
-            temp_line = f"{temp_c:.1f}°C ({temp_f:.1f}°F)"
-
-        return (
-            f"LIVE WEATHER for {location} (fetched {fetched_at}):\n"
-            f"Temperature: {temp_line}\n"
-            f"Conditions: {condition}\n"
-            f"Humidity: {humidity}%\n"
-            f"Wind: {wind} km/h\n"
-            f"Source: Open-Meteo live API."
-        )
-    except Exception as e:
-        return f"Weather lookup failed: {e}"
-
-
-# ============================================================================
-# ADDRESS LOOKUP
-# ============================================================================
-
-ADDRESS_OVERRIDES = {
-    "texaco claxton ga": "601 W Main St, Claxton, GA 30417 (verified by Sharar, overrides map data)",
-}
-
-
-def get_address(place_query):
-    query_tokens = set(place_query.strip().lower().replace(",", " ").split())
-
-    for key, addr in ADDRESS_OVERRIDES.items():
-        key_tokens = set(key.replace(",", " ").split())
-        if key_tokens.issubset(query_tokens):
-            return f"VERIFIED ADDRESS, manually confirmed override: {addr}"
-
-    try:
-        r = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={
-                "q": place_query,
-                "format": "json",
-                "limit": 3,
-                "addressdetails": 1
-            },
-            headers={"User-Agent": "laozis-bar-address-tool/1.0"},
-            timeout=10,
-        )
-        results = r.json()
-
-        if not results:
-            return (
-                f"No verified address found for '{place_query}' in OpenStreetMap/Nominatim. "
-                "Do not guess. Tell the user the address could not be verified."
-            )
-
-        formatted = []
-        for item in results:
-            formatted.append(f"- {item.get('display_name')}")
-
-        return (
-            f"VERIFIED ADDRESS LOOKUP for '{place_query}' "
-            f"(source: OpenStreetMap/Nominatim):\n"
-            + "\n".join(formatted)
-            + "\n\nIf multiple results appear, ask which one matches."
-        )
-    except Exception as e:
-        return f"Address lookup failed: {e}"
-
-
-# ============================================================================
-# SEARCH
-# ============================================================================
-
-def freshness_label(title, snippet):
-    current_year = str(datetime.now().year)
-    current_month = datetime.now().strftime("%B").lower()
-    text = f"{title} {snippet}".lower()
-
-    if any(word in text for word in ["today", "live", "updated", "now", "minutes ago", "hours ago"]):
-        return "LIKELY FRESH"
-    if current_month in text and current_year in text:
-        return "PROBABLY RECENT"
-    if current_year in text:
-        return "MAY BE CURRENT"
-    return "FRESHNESS UNKNOWN"
-
-
-def format_search_results(results, source_name):
-    if not results:
-        return None
-
-    today = datetime.now().strftime("%B %d, %Y")
-    cards = []
-
-    for i, r in enumerate(results, 1):
-        title = r.get("title", "No title")
-        href = r.get("href", "No URL")
-        body = r.get("body", "No snippet")
-        fresh = freshness_label(title, body)
-
-        cards.append(
-            f"--- Result {i} ---\n"
-            f"Freshness: {fresh}\n"
-            f"Title: {title}\n"
-            f"URL: {href}\n"
-            f"Snippet: {body}"
-        )
-
-    return (
-        "\n\n".join(cards)
-        + f"\n\nSearch completed: {today}\n"
-        + f"Source: {source_name}"
-    )
-
-
-def duckduckgo_raw_search(query, max_results=5):
-    try:
-        r = requests.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": query},
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                )
-            },
-            timeout=15,
-        )
-
-        if r.status_code != 200:
-            return None
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        results = []
-
-        for block in soup.select(".result"):
-            title_el = block.select_one(".result__a")
-            snippet_el = block.select_one(".result__snippet")
-
-            if not title_el:
-                continue
-
-            title = title_el.get_text(" ", strip=True)
-            href = title_el.get("href", "")
-            snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
-
-            if title:
-                results.append({
-                    "title": html.unescape(title),
-                    "href": html.unescape(href),
-                    "body": html.unescape(snippet),
-                })
-
-            if len(results) >= max_results:
-                break
-
-        return results or None
-    except Exception as e:
-        log.warning(f"Raw DuckDuckGo search failed: {e}")
-        return None
-
-
-def ddgs_search(query, max_results=5, timelimit=None):
-    try:
-        kwargs = {
-            "max_results": max_results,
-            "backend": "lite",
-        }
-        if timelimit:
-            kwargs["timelimit"] = timelimit
-
-        results = list(DDGS().text(query, **kwargs))
-        return results or None
-    except Exception as e:
-        log.warning(f"DDGS search failed: {e}")
-        return None
-
-
-def search_recent_news(query):
-    results = ddgs_search(query, max_results=5, timelimit="w")
-    formatted = format_search_results(results, "DuckDuckGo/DDGS, 7-day filter")
-    if formatted:
-        return formatted[:MAX_TOOL_RESULT_CHARS]
-
-    results = duckduckgo_raw_search(query, max_results=5)
-    formatted = format_search_results(results, "DuckDuckGo raw HTML fallback")
-    if formatted:
-        return (
-            formatted
-            + "\n\nWARNING: Raw fallback search has no strict recency filter. Treat freshness cautiously."
-        )[:MAX_TOOL_RESULT_CHARS]
-
-    return "Recent news search failed or returned no usable results."
-
-
-def search_general_web(query):
-    results = duckduckgo_raw_search(query, max_results=5)
-    formatted = format_search_results(results, "DuckDuckGo raw HTML")
-    if formatted:
-        return formatted[:MAX_TOOL_RESULT_CHARS]
-
-    results = ddgs_search(query, max_results=5)
-    formatted = format_search_results(results, "DuckDuckGo/DDGS fallback")
-    if formatted:
-        return formatted[:MAX_TOOL_RESULT_CHARS]
-
-    return "General web search failed or returned no usable results."
-
-
-# ============================================================================
-# URL AND YOUTUBE EXTRACTION
-# ============================================================================
-
-def normalize_url(url):
-    return url.strip().rstrip(".,)]}>\"'")
-
-
-def extract_youtube_id(url):
-    patterns = [
-        r"(?:v=)([0-9A-Za-z_-]{11})",
-        r"(?:youtu\.be/)([0-9A-Za-z_-]{11})",
-        r"(?:embed/)([0-9A-Za-z_-]{11})",
-        r"(?:shorts/)([0-9A-Za-z_-]{11})",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-
-    return None
-
-
-def get_youtube_transcript(video_id):
-    try:
-        transcript = youtube_transcript_api.YouTubeTranscriptApi.get_transcript(video_id)
-        text = " ".join(item.get("text", "") for item in transcript)
-        return text[:MAX_LINK_CHARS]
-    except Exception as e:
-        log.warning(f"YouTube transcript failed for {video_id}: {e}")
-        return f"[Transcript unavailable: {e}]"
-
-
-def is_safe_url(url):
-    try:
-        parsed = urlparse(url)
-
-        if parsed.scheme not in {"http", "https"}:
-            return False
-
-        host = parsed.hostname
-        if not host:
-            return False
-
-        resolved = socket.getaddrinfo(host, None)
-
-        for result in resolved:
-            ip = result[4][0]
-            ip_obj = ipaddress.ip_address(ip)
-
-            if (
-                ip_obj.is_loopback
-                or ip_obj.is_private
-                or ip_obj.is_link_local
-                or ip_obj.is_multicast
-                or ip_obj.is_reserved
-                or ip_obj.is_unspecified
-            ):
-                return False
-
+        TG_CONN.commit()
         return True
-    except Exception as e:
-        log.warning(f"URL safety check failed for {url}: {e}")
+    except sqlite3.IntegrityError:
         return False
 
-
-def extract_webpage_text(url):
-    if not is_safe_url(url):
-        return "[Access denied: URL points to a restricted or unsafe network destination.]"
-
+def scrape_telegram_channel(channel_name: str, max_posts: int = MAX_TELEGRAM_POSTS_PER_CHANNEL):
+    url = f"https://t.me/s/{channel_name}"
     try:
         r = requests.get(
             url,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=12
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+            timeout=20,
         )
-        r.raise_for_status()
+        if r.status_code != 200:
+            return []
 
         soup = BeautifulSoup(r.text, "html.parser")
+        posts = []
+        message_wraps = soup.select(".tgme_widget_message_wrap") or soup.select("[class*='tgme_widget_message']")
 
-        for element in soup(["script", "style", "nav", "footer", "header", "aside"]):
-            element.decompose()
+        for wrap in message_wraps[:max_posts]:
+            try:
+                time_el = wrap.select_one(".tgme_widget_message_date time")
+                timestamp = time_el.get("datetime", "") if time_el else ""
+                text_el = wrap.select_one(".tgme_widget_message_text")
+                text_content = text_el.get_text("\n", strip=True) if text_el else ""
+                link_el = wrap.select_one(".tgme_widget_message_date a")
+                post_url = link_el.get("href", "") if link_el else ""
+                if post_url and not post_url.startswith("http"):
+                    post_url = f"https://t.me{post_url}"
 
-        text = soup.get_text(separator="\n")
-        lines = [line.strip() for line in text.splitlines()]
-        clean = "\n".join(line for line in lines if line)
+                if text_content:
+                    posts.append({"timestamp": timestamp, "text": text_content, "url": post_url})
+            except Exception:
+                continue
+        return posts
+    except requests.RequestException:
+        return []
 
-        return clean[:MAX_LINK_CHARS]
-    except Exception as e:
-        log.warning(f"Webpage extraction failed for {url}: {e}")
-        return f"[Article extraction failed: {e}]"
+def scan_all_telegram_channels(keyword: str = None):
+    all_posts = []
+    total_new = 0
 
+    for channel in TELEGRAM_CHANNELS:
+        posts = scrape_telegram_channel(channel)
+        for post in posts:
+            text = post["text"]
+            if keyword and keyword.lower() not in text.lower():
+                continue
+            is_new = _cache_telegram_post(channel, post.get("url", ""), post.get("timestamp", ""), "", text)
+            if is_new:
+                total_new += 1
+            all_posts.append({"channel": channel, **post, "is_new": is_new})
 
-def process_links(user_text):
-    urls = re.findall(r"https?://\S+", user_text)
-    if not urls:
-        return ""
+    if not all_posts:
+        return "[Telegram Scan: No posts found.]"
 
-    blocks = ["\n\n=== SHARED LINK INTELLIGENCE ==="]
+    lines = [f"═══ TELEGRAM SCAN (New: {total_new}) ═══\n"]
+    by_channel = defaultdict(list)
+    for p in all_posts:
+        by_channel[p["channel"]].append(p)
 
-    for raw in urls:
-        url = normalize_url(raw)
+    for channel, posts in by_channel.items():
+        lines.append(f"─── @{channel} ───")
+        for post in posts[:5]:
+            ts = post.get("timestamp", "?")[:19]
+            lines.append(f"[{ts}] {post['text'][:200]}... {post.get('url','')}")
+        lines.append("")
 
-        if "youtube.com" in url or "youtu.be" in url:
-            video_id = extract_youtube_id(url)
-            if video_id:
-                transcript = get_youtube_transcript(video_id)
-                blocks.append(f"\n[YouTube Transcript: {url}]\n{transcript}")
-            else:
-                blocks.append(f"\n[YouTube link detected, but no video ID extracted: {url}]")
-        else:
-            text = extract_webpage_text(url)
-            blocks.append(f"\n[Article/Text Extract: {url}]\n{text}")
+    return "\n".join(lines)[:MAX_TOOL_RESULT_CHARS]
 
-    blocks.append("\n=== END SHARED LINK INTELLIGENCE ===")
-    return "\n".join(blocks)
-
-
-# ============================================================================
-# TOOL SCHEMAS AND TOOL LOOP
-# ============================================================================
-
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_recent_news",
-            "description": "Search recent news and current developments from roughly the last 7 days.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Specific recent-news query."}
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_general_web",
-            "description": "Search general web/background information, stable facts, definitions, and history.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "General web search query."}
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get live weather/temperature for a specific place. Use this for weather questions.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {"type": "string", "description": "City or place, e.g. Claxton, GA or Kyiv, Ukraine."}
-                },
-                "required": ["location"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_address",
-            "description": "Look up verified street addresses for named places. Use this for address/location questions.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "place_query": {"type": "string", "description": "Specific place plus city/state/country."}
-                },
-                "required": ["place_query"],
-            },
-        },
-    },
-]
-
-
-def normalize_tool_call(tc, index=0):
-    if isinstance(tc, dict):
-        return {
-            "id": tc.get("id", f"call_{index}"),
-            "type": tc.get("type", "function"),
-            "function": {
-                "name": tc.get("function", {}).get("name", ""),
-                "arguments": tc.get("function", {}).get("arguments", "{}"),
-            },
-        }
-
-    if hasattr(tc, "model_dump"):
-        return tc.model_dump()
-
-    tc_id = getattr(tc, "id", f"call_{index}")
-    func = getattr(tc, "function", None)
-
-    if func is None:
-        return {
-            "id": tc_id,
-            "type": "function",
-            "function": {"name": "", "arguments": "{}"},
-        }
-
-    name = getattr(func, "name", "")
-    args = getattr(func, "arguments", "{}")
-
-    return {
-        "id": tc_id,
-        "type": "function",
-        "function": {"name": name, "arguments": args},
-    }
-
-
-def extract_func_info(tc):
-    if isinstance(tc, dict):
-        func = tc.get("function", {})
-        return func.get("name", ""), func.get("arguments", "{}")
-
-    func = getattr(tc, "function", None)
-    if func is None:
-        return "", "{}"
-
-    return getattr(func, "name", ""), getattr(func, "arguments", "{}")
-
-
-def get_tc_id(tc, index=0):
-    if isinstance(tc, dict):
-        return tc.get("id", f"call_{index}")
-    return getattr(tc, "id", f"call_{index}")
-
-
-def dispatch_tool_call(func_name, func_args_str):
-    try:
-        args = json.loads(func_args_str or "{}")
-    except json.JSONDecodeError:
-        args = {}
-
-    if func_name == "search_recent_news":
-        return search_recent_news(args.get("query", ""))
-
-    if func_name == "search_general_web":
-        return search_general_web(args.get("query", ""))
-
-    if func_name == "get_weather":
-        return get_weather(args.get("location", ""))
-
-    if func_name == "get_address":
-        return get_address(args.get("place_query", ""))
-
-    return f"Unknown tool: {func_name}"
-
-
-ADDRESS_KEYWORDS = (
-    "address", "located at", "where is", "where's", "wheres",
-    "what's the location", "location of", "find the address",
-    "directions to", "how do i get to",
-)
-
-WEATHER_KEYWORDS = (
-    "temperature", "weather", "how hot", "how cold",
-    "degrees outside", "what's it like outside",
-    "is it raining", "is it snowing", "forecast",
-    "humidity", "how warm",
-)
-
-
-def detect_forced_tool(user_text):
-    text = user_text.lower().replace("'", "")
-
-    if any(k in text for k in ADDRESS_KEYWORDS):
-        return "get_address"
-
-    if any(k in text for k in WEATHER_KEYWORDS):
-        return "get_weather"
-
-    return None
-
-
-# ============================================================================
-# API MESSAGE BUILDING
-# ============================================================================
-
-def build_api_messages(user_runtime_input, current_message_id=None):
-    relevant_memory = search_memory(
-        user_runtime_input,
-        limit=MAX_MEMORY_RESULTS,
-        exclude_message_id=current_message_id,
-    )
-
-    memory_block = ""
-    if relevant_memory:
-        memory_block = (
-            "\n\n[RELEVANT LONG-TERM MEMORY]\n"
-            f"{relevant_memory}\n"
-            "[END RELEVANT LONG-TERM MEMORY]\n"
-            "Use this only if it helps. Do not recite it mechanically.\n"
+def init_chat_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp TEXT NOT NULL DEFAULT (datetime('now'))
         )
-
-    system = SYSTEM_PROMPT + memory_block
-
-    recent_history = get_recent_api_history(
-        limit=MAX_RECENT_TURNS,
-        before_id=current_message_id,
-    )
-
-    return [
-        {"role": "system", "content": system},
-        *recent_history,
-        {"role": "user", "content": user_runtime_input},
-    ]
-
-
-def run_completion_with_tools(api_messages):
-    messages = list(api_messages)
-    max_hops = 5
-    seen_calls = set()
-
-    last_user_text = ""
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            last_user_text = m.get("content", "")
-            break
-
-    forced_tool = detect_forced_tool(last_user_text)
-
-    for hop in range(max_hops):
-        tool_choice_param = "auto"
-        if forced_tool and hop == 0:
-            tool_choice_param = {
-                "type": "function",
-                "function": {"name": forced_tool},
-            }
-
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice=tool_choice_param,
-            extra_body={"thinking": {"type": "disabled"}},
-        )
-
-        msg = response.choices[0].message
-
-        if not msg.tool_calls:
-            return msg.content or "(No response from model.)"
-
-        normalized_calls = [
-            normalize_tool_call(tc, index=i)
-            for i, tc in enumerate(msg.tool_calls)
-        ]
-
-        duplicate_count = 0
-        for tc in msg.tool_calls:
-            func_name, func_args_str = extract_func_info(tc)
-            signature = (func_name, func_args_str)
-            if signature in seen_calls:
-                duplicate_count += 1
-            else:
-                seen_calls.add(signature)
-
-        if duplicate_count == len(msg.tool_calls) and hop >= 1:
-            return "(Shifu already checked those shelves. The same search again will not make the bottle fuller.)"
-
-        messages.append({
-            "role": "assistant",
-            "content": msg.content or "",
-            "tool_calls": normalized_calls,
-        })
-
-        for i, tc in enumerate(msg.tool_calls):
-            func_name, func_args_str = extract_func_info(tc)
-            result = dispatch_tool_call(func_name, func_args_str)
-
-            tool_memory = (
-                f"Tool used: {func_name}\n"
-                f"Arguments: {func_args_str}\n"
-                f"Result:\n{result[:MAX_TOOL_RESULT_CHARS]}"
-            )
-            append_message("tool_memory", tool_memory, visible=False)
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": get_tc_id(tc, index=i),
-                "name": func_name,
-                "content": result[:MAX_TOOL_RESULT_CHARS],
-            })
-
-    return "(Tool loop exceeded maximum hops. Shifu stops before the machine starts chewing its own tail.)"
-
-
-# ============================================================================
-# STARTUP DATABASE INIT
-# ============================================================================
-
-init_db()
-migrate_legacy_history_once()
-
-
-# ============================================================================
-# SIDEBAR MEMORY TOOLS
-# ============================================================================
-
-with st.sidebar:
-    st.header("Memory")
-
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM messages")
-    total_messages = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM messages WHERE visible = 1")
-    visible_messages = cur.fetchone()[0]
+    """)
+    conn.commit()
     conn.close()
 
-    st.metric("Stored records", total_messages)
-    st.metric("Visible chat turns", visible_messages)
+def load_history(limit=MAX_RECENT_TURNS):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT role, content FROM history ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    return [{"role": r, "content": c} for r, c in reversed(rows)]
 
-    memory_query = st.text_input("Search memory")
-    if memory_query:
-        result = search_memory(memory_query, limit=10)
-        if result:
-            st.text_area("Memory hits", result, height=300)
-        else:
-            st.write("No memory hit.")
+def save_message(role, content):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT INTO history (role, content) VALUES (?, ?)", (role, content))
+    conn.commit()
+    conn.close()
 
-    st.download_button(
-        "Download visible archive JSON",
-        data=export_archive_json(),
-        file_name="shifu_visible_archive.json",
-        mime="application/json",
-    )
-
+init_chat_db()
 
 # ============================================================================
-# CHAT DISPLAY
+# STREAMLIT UI & FULL TERMINAL THEME
 # ============================================================================
 
-if "session_start_id" not in st.session_state:
-    st.session_state.session_start_id = get_last_visible_id()
+st.set_page_config(page_title=APP_TITLE, page_icon=APP_ICON, layout="centered")
 
-with st.expander("📜 View full visible chat archive"):
-    for msg_id, role, content, created_at in fetch_visible_messages():
-        with st.chat_message(role):
-            st.caption(created_at)
-            st.write(content)
+def image_file_to_data_uri(path):
+    try:
+        path = Path(path)
+        if not path.is_file():
+            return ""
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+    except Exception:
+        return ""
 
-for msg_id, role, content, created_at in fetch_visible_messages(
-    after_id=st.session_state.session_start_id
-):
-    with st.chat_message(role):
-        st.write(content)
+background_uri = image_file_to_data_uri(BACKGROUND_IMAGE_PATH) if SHOW_BACKGROUND_IMAGE else ""
+if background_uri:
+    background_rule = f"linear-gradient(rgba(0, 7, 2, 0.82), rgba(0, 7, 2, 0.94)), url('{background_uri}') center center / cover fixed"
+else:
+    background_rule = "radial-gradient(circle at 18% 0%, rgba(36, 255, 94, 0.11), transparent 34%), linear-gradient(145deg, #020603 0%, #000000 54%, #061007 100%)"
 
+css = r"""
+<style>
+:root {
+    --crt-green: #55ff77;
+    --crt-green-soft: #9affad;
+    --crt-green-dim: #1b7a34;
+    --crt-panel: rgba(0, 10, 3, 0.86);
+    --crt-amber: #e6c66a;
+}
+html, body, [class*="css"] {
+    font-family: "DejaVu Sans Mono", "Liberation Mono", Consolas, monospace !important;
+}
+.stApp {
+    background: __BACKGROUND_RULE__;
+    color: var(--crt-green-soft);
+    min-height: 100vh;
+}
+.stApp::before {
+    content: "";
+    position: fixed; inset: 0; pointer-events: none; z-index: 9998; opacity: 0.17;
+    background: repeating-linear-gradient(to bottom, rgba(255,255,255,0.035) 0px, rgba(255,255,255,0.035) 1px, transparent 1px, transparent 4px);
+    mix-blend-mode: screen;
+}
+
+.block-container {
+    max-width: 1000px !important;
+    margin: 0 auto !important;
+}
+
+[data-testid="stHeader"], header { visibility: hidden !important; }
+.stDeployButton { display: none !important; }
+#MainMenu { visibility: hidden !important; }
+
+.laozi-terminal-hero {
+    position: relative; overflow: hidden; margin: 0 0 1.1rem 0; padding: 1.2rem 1.35rem 1rem 1.35rem;
+    border: 1px solid rgba(85, 255, 119, 0.48); border-radius: 5px;
+    background: transparent !important;
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.92), 0 0 24px rgba(45, 255, 93, 0.24);
+    text-shadow: 0 0 8px rgba(85,255,119,0.52);
+}
+.laozi-kicker { color: var(--crt-green-dim); font-size: 0.74rem; letter-spacing: 0.18em; margin-bottom: 0.34rem; }
+.laozi-title { color: var(--crt-green); font-size: clamp(1.85rem, 4vw, 3.3rem); line-height: 1; font-weight: 800; margin: 0; }
+.laozi-subtitle { margin-top: 0.55rem; color: var(--crt-green-soft); font-size: 0.9rem; }
+.laozi-status-row { display: flex; flex-wrap: wrap; gap: 0.45rem 1rem; margin-top: 0.9rem; padding-top: 0.72rem; border-top: 1px dashed rgba(85,255,119,0.25); color: #7adf8e; font-size: 0.72rem; }
+
+[data-testid="stExpander"] { background: rgba(0, 8, 2, 0.88); border: 1px solid rgba(85,255,119,0.25); border-radius: 4px; }
+[data-testid="stExpander"] summary { color: var(--crt-green) !important; }
+
+[data-testid="stChatMessage"] { background: var(--crt-panel); border: 1px solid rgba(85,255,119,0.25); border-left: 4px solid var(--crt-green-dim); border-radius: 4px; padding: 0.8rem 0.95rem; margin: 0.7rem 0; box-shadow: 0 8px 28px rgba(0,0,0,0.32); backdrop-filter: blur(7px); }
+[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) { border-left-color: var(--crt-amber); background: rgba(9, 11, 3, 0.89); }
+[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) { border-left-color: var(--crt-green); }
+[data-testid="stChatMessage"] p, li { color: #d1f7d8; line-height: 1.62; }
+[data-testid="stChatInput"] { background: rgba(0, 8, 2, 0.96); border: 1px solid rgba(85, 255, 119, 0.48); border-radius: 4px; }
+[data-testid="stChatInput"] textarea { color: var(--crt-green-soft) !important; }
+.stButton button { background: rgba(0, 24, 6, 0.92) !important; color: var(--crt-green) !important; border: 1px solid rgba(85,255,119,0.45) !important; }
+</style>
+""".replace("__BACKGROUND_RULE__", background_rule)
+st.markdown(css, unsafe_allow_html=True)
+
+st.markdown(
+    f"""
+    <section class="laozi-terminal-hero">
+        <div class="laozi-kicker">&gt; /HOME/SHARAR/THE.BAR/SHIFU</div>
+        <div class="laozi-title">LAOZI'S BAR</div>
+        <div class="laozi-subtitle">Drink deep. Speak softly. Return to the source.</div>
+        <div class="laozi-status-row">
+            <span><b>SHIFU:</b> ONLINE</span>
+            <span><b>MODEL:</b> {MODEL}</span>
+            <span><b>MEMORY:</b> SQLITE + FTS5</span>
+            <span><b>SEARCH:</b> ARMED</span>
+            <span><b>VOICE:</b> ON</span>
+            <span><b>VISION:</b> GPT-4O-MINI (BYPASS)</span>
+            <span><b>BACKDROP:</b> ONLINE</span>
+        </div>
+    </section>
+    """,
+    unsafe_allow_html=True,
+)
+
+if not DEEPSEEK_API_KEY:
+    st.error("DEEPSEEK_API_KEY is missing. Export it in your environment.")
+    st.stop()
+
+client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+vision_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+CURRENT_LOCAL_DATETIME = datetime.now().strftime("%B %d, %Y %I:%M %p")
+SYSTEM_PROMPT = f"""
+[CURRENT LOCAL TIME: {CURRENT_LOCAL_DATETIME}]
+You are Shifu, a direct and observant bartender running Laozi's Bar.
+You help the user with scraping, research, situational awareness, and problem-solving.
+"""
+
+if "messages" not in st.session_state:
+    st.session_state.messages = load_history()
 
 # ============================================================================
-# CHAT INPUT
+# EXPANDER & COMMAND DECK (MATCHING YOUR SCREENSHOT)
 # ============================================================================
 
-if prompt := st.chat_input("Ask Shifu anything..."):
+with st.expander("> ARCHIVE TOOLS"):
+    st.markdown("**TELEGRAM MONITOR**")
+    if st.button("Run Full Telegram Scan"):
+        with st.spinner("Scraping channels..."):
+            res = scan_all_telegram_channels()
+            st.session_state.messages.append({"role": "system", "content": res})
+            save_message("system", res)
+            st.rerun()
+            
+    if st.button("Clear Terminal History"):
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("DELETE FROM history")
+        conn.commit()
+        st.session_state.messages = []
+        st.rerun()
+
+st.markdown("""
+<div style='color: #1b7a34; font-size: 0.85rem; margin-bottom: 1.5rem; margin-top: 1rem;'>
+&gt; MEMORY MOUNTED<br>
+&gt; PRIOR SESSION CHAT HIDDEN<br>
+&gt; TYPE OR SPEAK BELOW
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("<div style='font-size: 0.85rem; color: #9affad; margin-bottom: -10px; font-weight: bold;'>🎛️ COMMAND DECK</div>", unsafe_allow_html=True)
+
+col1, col2 = st.columns(2)
+
+with col1:
+    uploaded_file = st.file_uploader("📎 ATTACH FILE", type=["png", "jpg", "webp", "txt", "py"])
+
+with col2:
+    audio_val = st.audio_input("🎤 RECORD VOICE")
+
+# ============================================================================
+# MAIN CHAT LOOP
+# ============================================================================
+
+user_input = st.chat_input("Message Shifu... (or hit Enter to send uploads)")
+
+# Process Audio Input
+if audio_val and not user_input:
+    if "last_processed_audio" not in st.session_state or st.session_state.last_processed_audio != audio_val:
+        r = sr.Recognizer()
+        with sr.AudioFile(audio_val) as source:
+            audio_data = r.record(source)
+            try:
+                user_input = r.recognize_google(audio_data)
+                st.session_state.last_processed_audio = audio_val
+            except Exception as e:
+                st.error(f"Could not understand audio: {e}")
+
+if user_input:
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    save_message("user", user_input)
     with st.chat_message("user"):
-        st.write(prompt)
+        st.write(user_input)
 
-    current_msg_id = append_message("user", prompt, visible=True)
+    file_context = ""
+    image_context = ""
+    
+    if uploaded_file:
+        ext = uploaded_file.name.split('.')[-1].lower()
+        if ext in ['png', 'jpg', 'jpeg', 'webp'] and vision_client:
+            try:
+                img = Image.open(uploaded_file)
+                buffered = io.BytesIO()
+                img.save(buffered, format="PNG")
+                img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                
+                vision_res = vision_client.chat.completions.create(
+                    model=VISION_MODEL,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this image in detail."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                        ]
+                    }]
+                )
+                image_context = f"\n[ATTACHED IMAGE: {vision_res.choices[0].message.content}]"
+            except Exception as e:
+                log.error(f"Vision error: {e}")
+        else:
+            try:
+                content_str = uploaded_file.read().decode("utf-8", errors="ignore")
+                file_context = f"\n[ATTACHED FILE ({uploaded_file.name}):\n{content_str[:MAX_LINK_CHARS]}\n]"
+            except Exception as e:
+                log.error(f"Doc error: {e}")
 
-    link_intel = process_links(prompt)
-    if link_intel:
-        append_message("link_memory", link_intel, visible=False)
-        runtime_input = prompt + "\n\n" + link_intel
-    else:
-        runtime_input = prompt
+    api_messages = [{"role": "system", "content": SYSTEM_PROMPT + file_context + image_context}] + st.session_state.messages[-MAX_RECENT_TURNS:]
 
     with st.chat_message("assistant"):
-        with st.spinner("Shifu is thinking, searching, or pretending not to care..."):
+        with st.spinner("Shifu is thinking..."):
             try:
-                api_messages = build_api_messages(
-                    user_runtime_input=runtime_input,
-                    current_message_id=current_msg_id,
+                response = client.chat.completions.create(
+                    model=MODEL,
+                    messages=api_messages,
+                    temperature=0.7
                 )
-                reply = run_completion_with_tools(api_messages)
+                reply = response.choices[0].message.content
+                st.write(reply)
+                st.session_state.messages.append({"role": "assistant", "content": reply})
+                save_message("assistant", reply)
             except Exception as e:
-                log.error(f"DeepSeek call failed: {e}")
-                reply = f"(Error talking to DeepSeek: {e})"
-
-            st.write(reply)
-
-    append_message("assistant", reply, visible=True)
+                st.error(f"Execution failed: {e}")
